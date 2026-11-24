@@ -7,9 +7,9 @@ import { demo } from "../lib/demo";
 import { type Chart, type Chord, type Measure, keys, parseMusicXML, pitch, transpose } from "../lib/music";
 
 const paperSizes = { letter: { width: 816, height: 1056, css: "letter" }, a4: { width: 793.7, height: 1122.5, css: "A4" } };
-const initial = { perLine: 4, lyricSize: 13, chordSize: 16, margin: 0.55, paper: "letter" as keyof typeof paperSizes, numbers: true, cues: true };
+const initial = { perLine: 0, lyricSize: 13, chordSize: 16, margin: 0.55, paper: "letter" as keyof typeof paperSizes, numbers: true, cues: true };
 
-type Row = { start: number; measures: Measure[] };
+type Row = { start: number; widths: number[] };
 
 function chordText(chord: Chord, shift: number, flats: boolean) {
   return transpose(chord.root, shift, flats) + chord.suffix + (chord.bass ? "/" + transpose(chord.bass, shift, flats) : "");
@@ -33,11 +33,13 @@ export default function Editor() {
   const [breaks, setBreaks] = useState<Record<number, "line" | "page">>({});
   const [boundary, setBoundary] = useState("1");
   const [fit, setFit] = useState(1);
+  const [measureWidths, setMeasureWidths] = useState<number[]>([]);
   const [pageRows, setPageRows] = useState<Row[][]>([]);
   const xml = useRef("");
   const upload = useRef<HTMLInputElement>(null);
   const importSequence = useRef(0);
   const canvas = useRef<HTMLDivElement>(null);
+  const widthProbe = useRef<HTMLDivElement>(null);
   const measurement = useRef<HTMLDivElement>(null);
   const paper = paperSizes[settings.paper];
   const margin = settings.margin * 96;
@@ -46,18 +48,32 @@ export default function Editor() {
   const tonic = target || chart.key?.tonic;
   const setting = <K extends keyof typeof initial>(key: K, value: (typeof initial)[K]) => setSettings(previous => ({ ...previous, [key]: value }));
 
+  const contentWidth = paper.width - 2 * margin;
+
   const rows = useMemo(() => {
     const result: Row[] = [];
     let row: Row | undefined;
+    let used = 0;
     for (const [index, measure] of chart.measures.entries()) {
-      if (!row || row.measures.length >= settings.perLine || measure.section.length || breaks[index]) {
-        row = { start: index, measures: [] };
+      const width = Math.min(contentWidth, measureWidths[index] ?? 150);
+      const atLimit = settings.perLine > 0 && row?.widths.length === settings.perLine;
+      if (!row || atLimit || used + width > contentWidth || measure.section.length || breaks[index]) {
+        row = { start: index, widths: [] };
         result.push(row);
+        used = 0;
       }
-      row.measures.push(measure);
+      row.widths.push(width);
+      used += width;
     }
     return result;
-  }, [chart, breaks, settings.perLine]);
+  }, [chart, breaks, contentWidth, measureWidths, settings.perLine]);
+
+  useLayoutEffect(() => {
+    const probe = widthProbe.current;
+    if (!probe) return;
+    // Round up and leave room for the closing barline on any measure.
+    setMeasureWidths(Array.from(probe.children, element => Math.ceil(element.getBoundingClientRect().width) + 1));
+  }, [chart, verse, shift, preferFlats, settings.chordSize, settings.lyricSize, settings.cues, settings.numbers]);
 
   useLayoutEffect(() => {
     const canvasElement = canvas.current;
@@ -140,32 +156,37 @@ export default function Editor() {
     </div>;
   }
 
+  function renderMeasure(measure: Measure, index: number) {
+    const verses = verse ? [verse] : chart.verses.filter(id => measure.events.some(event => event.lyrics[id]));
+    return <div className="measure" key={index} data-measure={measure.number}>
+      <div className="measure-marks">
+        {measure.section.map((section, i) => <strong className="section-mark" key={i}>{section}</strong>)}
+        {measure.ending && <span className="ending">{measure.ending}</span>}
+      </div>
+      <div className="measure-meta">
+        {settings.numbers && <span className="measure-number">{measure.number}</span>}
+        {measure.leftRepeat && <b aria-label="Start repeat">{measure.leftRepeat}</b>}
+        {index > 0 && measure.time && <b>{measure.time}</b>}
+        {index > 0 && measure.key && <b>Key {transpose(measure.key.tonic, shift, preferFlats)}{measure.key.mode === "minor" ? "m" : ""}</b>}
+        {measure.rightRepeat && <b className="end-repeat" aria-label={"End repeat " + measure.rightRepeat}>{measure.rightRepeat}</b>}
+      </div>
+      <div className="events">
+        {measure.events.map(event => <div className="event" key={event.beat}>
+          <div className="chord">{event.chord && chordText(event.chord, shift, preferFlats)}</div>
+          {verses.map(id => <div className="lyric" key={id}>{event.lyrics[id]}</div>)}
+        </div>)}
+      </div>
+      {settings.cues && measure.cues.length > 0 && <div className="cues">{measure.cues.join(" · ")}</div>}
+    </div>;
+  }
+
   function renderRow(row: Row) {
     return <div className="chart-row" key={row.start}>
-      <div className="measure-grid">
-        {row.measures.map((measure, column) => {
+      <div className="measure-grid" style={{ gridTemplateColumns: row.widths.map(width => width + "px").join(" ") }}>
+        {row.widths.map((_, column) => {
           const index = row.start + column;
-          const verses = verse ? [verse] : chart.verses.filter(id => measure.events.some(event => event.lyrics[id]));
-          return <div className="measure" key={index} data-measure={measure.number}>
-            <div className="measure-marks">
-              {measure.section.map((section, i) => <strong className="section-mark" key={i}>{section}</strong>)}
-              {measure.ending && <span className="ending">{measure.ending}</span>}
-            </div>
-            <div className="measure-meta">
-              {settings.numbers && <span className="measure-number">{measure.number}</span>}
-              {measure.leftRepeat && <b aria-label="Start repeat">{measure.leftRepeat}</b>}
-              {index > 0 && measure.time && <b>{measure.time}</b>}
-              {index > 0 && measure.key && <b>Key {transpose(measure.key.tonic, shift, preferFlats)}{measure.key.mode === "minor" ? "m" : ""}</b>}
-              {measure.rightRepeat && <b className="end-repeat" aria-label={"End repeat " + measure.rightRepeat}>{measure.rightRepeat}</b>}
-            </div>
-            <div className="events">
-              {measure.events.map(event => <div className="event" key={event.beat}>
-                <div className="chord">{event.chord && chordText(event.chord, shift, preferFlats)}</div>
-                {verses.map(id => <div className="lyric" key={id}>{event.lyrics[id]}</div>)}
-              </div>)}
-            </div>
-            {settings.cues && measure.cues.length > 0 && <div className="cues">{measure.cues.join(" · ")}</div>}
-          </div>;
+          const measure = chart.measures[index];
+          return measure && renderMeasure(measure, index);
         })}
       </div>
     </div>;
@@ -204,7 +225,8 @@ export default function Editor() {
         <section className="panel">
           <h2><SlidersHorizontal size={17} /> Layout</h2>
           <div className="settings-grid">
-            <Select label="Measures per line" value={settings.perLine} onChange={value => setting("perLine", Number(value))}>
+            <Select label="Max. measures per line" value={settings.perLine} onChange={value => setting("perLine", Number(value))}>
+              <option value="0">Fit lyrics</option>
               {[1,2,3,4,5,6].map(value => <option key={value}>{value}</option>)}
             </Select>
             <Select label="Paper size" value={settings.paper} onChange={value => setting("paper", value as keyof typeof paperSizes)}>
@@ -249,7 +271,7 @@ export default function Editor() {
       <main className="preview" style={chartStyle}>
         <div className="preview-bar"><strong>Chart preview</strong><span>{chart.measures.length} measures <span className="separator">·</span> {pages.length} {pages.length === 1 ? "page" : "pages"}</span></div>
         <div className="canvas" ref={canvas}>
-          <div className="measurement" ref={measurement} aria-hidden="true">{chartHeader()}{rows.map(renderRow)}</div>
+          <div className="measurement" ref={measurement} aria-hidden="true">{chartHeader()}{rows.map(renderRow)}<div ref={widthProbe} className="measure-widths">{chart.measures.map(renderMeasure)}</div></div>
           <div className="sheets">
             {pages.map((page, index) => <article className="sheet" key={index} aria-label={"Page " + (index + 1)}>
               {index === 0 ? chartHeader() : <div className="continuation">{chart.title}</div>}
