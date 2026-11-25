@@ -2,14 +2,45 @@
 
 import { Button, Checkbox, Field, Label } from "@headlessui/react";
 import { Check, ChevronDown, FileMusic, FileUp, Music2, Printer, RotateCcw, Scissors, SlidersHorizontal } from "lucide-react";
-import { type ChangeEvent, type CSSProperties, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { type ChangeEvent, type CSSProperties, type KeyboardEvent, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { demo } from "../lib/demo";
 import { type Chart, type Chord, type Measure, keys, parseMusicXML, pitch, transpose } from "../lib/music";
 
 const paperSizes = { letter: { width: 816, height: 1056, css: "letter" }, a4: { width: 793.7, height: 1122.5, css: "A4" } };
-const initial = { perLine: 0, lyricSize: 13, chordSize: 16, margin: 0.55, paper: "letter" as keyof typeof paperSizes, numbers: true, cues: true };
+type BeatTicks = "always" | "never" | "without-lyrics";
+const chartColors = { measureColor: "#666666", chordColor: "#000000", lyricColor: "#333333" };
+const initial = { ...chartColors, beatTicks: "without-lyrics" as BeatTicks, perLine: 0, lyricSize: 13, chordSize: 16, margin: 0.55, paper: "letter" as keyof typeof paperSizes, numbers: true, cues: true };
 
 type Row = { start: number; widths: number[] };
+type Fragment = { measureIndex: number; start: number; end: number };
+const lyricPosition = (measure: number, event: number) => measure + ":" + event;
+type BreakType = "line" | "page";
+const lyricBreakType = (breaks: ReadonlySet<string>, position: string): BreakType | undefined =>
+  breaks.has(position + ":page") ? "page" : breaks.has(position) ? "line" : undefined;
+const breakLabel = (type: BreakType | undefined) =>
+  type === "page" ? "Page break before " : type === "line" ? "Line break before " : "Break position before ";
+
+
+// MusicXML positions are measured in quarter notes, including in compound meters.
+function measureRhythm(measure: Measure, meter: string) {
+  const slots = new Map<number, { beat: number; slash?: boolean; eventIndex?: number }>();
+  let duration = 0;
+  for (const [, groups, denominator] of meter.matchAll(/(\d+(?:\s*\+\s*\d+)*)\s*\/\s*(\d+)/g)) {
+    const count = groups.split("+").reduce((sum, group) => sum + Number(group), 0);
+    const step = 4 / Number(denominator);
+    if (!Number.isFinite(step)) continue;
+    for (let beat = 0; beat < count; beat++) {
+      const position = Math.round((duration + beat * step) * 10000) / 10000;
+      if (measure.pickupDuration !== undefined && position >= measure.pickupDuration) break;
+      slots.set(position, { beat: position, slash: true });
+    }
+    duration += count * step;
+  }
+  measure.events.forEach(({ beat }, eventIndex) => {
+    slots.set(beat, { ...slots.get(beat), beat, eventIndex });
+  });
+  return { slots: [...slots.values()].sort((a, b) => a.beat - b.beat), duration: measure.pickupDuration ?? duration };
+}
 
 function chordText(chord: Chord, shift: number, flats: boolean) {
   return transpose(chord.root, shift, flats) + chord.suffix + (chord.bass ? "/" + transpose(chord.bass, shift, flats) : "");
@@ -23,6 +54,44 @@ function Select({ label, value, onChange, children }: {
   </span></label>;
 }
 
+function RehearsalMarks({ marks, measure, canAdd, onChange }: {
+  marks: string[]; measure: string; canAdd: boolean; onChange: (marks: string[]) => void;
+}) {
+  const [edit, setEdit] = useState<{ index: number; text: string }>();
+
+  function save() {
+    if (!edit) return;
+    const text = edit.text.trim();
+    if (!text) return;
+    const next = [...marks];
+    next[edit.index] = text;
+    setEdit(undefined);
+    onChange(next);
+  }
+
+  return <>
+    {marks.map((mark, index) => <span className="section-mark" key={index}>
+      <button type="button" className="rehearsal-label" aria-label={"Edit rehearsal mark " + mark}
+        onClick={() => setEdit({ index, text: mark })}>{mark}</button>
+      <button type="button" className="rehearsal-remove" aria-label={"Remove rehearsal mark " + mark}
+        onClick={() => {
+          setEdit(undefined);
+          onChange(marks.filter((_, markIndex) => markIndex !== index));
+        }}>×</button>
+    </span>)}
+    {(canAdd || edit) && <div className="rehearsal-actions">
+      {edit ? <input className="rehearsal-field" aria-label={"Rehearsal mark for measure " + measure}
+        autoFocus value={edit.text} onChange={event => setEdit({ ...edit, text: event.target.value })}
+        onKeyDown={event => {
+          if (event.key === "Enter") { event.preventDefault(); save(); }
+          if (event.key === "Escape") { event.preventDefault(); setEdit(undefined); }
+        }} />
+        : <button type="button" className="rehearsal-add"
+            onClick={() => setEdit({ index: marks.length, text: "" })}>Add rehearsal mark</button>}
+    </div>}
+  </>;
+}
+
 export default function Editor() {
   const [chart, setChart] = useState<Chart>(demo);
   const [fileName, setFileName] = useState("");
@@ -30,7 +99,11 @@ export default function Editor() {
   const [target, setTarget] = useState("");
   const [verse, setVerse] = useState("");
   const [settings, setSettings] = useState(initial);
-  const [breaks, setBreaks] = useState<Record<number, "line" | "page">>({});
+  const beatTicks = settings.beatTicks ?? initial.beatTicks;
+  const [breaks, setBreaks] = useState<Partial<Record<number, BreakType | "none">>>({});
+  const [lyricBreaks, setLyricBreaks] = useState<Set<string>>(() => new Set());
+  const [selectedLyric, setSelectedLyric] = useState<string>();
+  const restoreLyricFocus = useRef(false);
   const [boundary, setBoundary] = useState("1");
   const [fit, setFit] = useState(1);
   const [measureWidths, setMeasureWidths] = useState<number[]>([]);
@@ -50,14 +123,51 @@ export default function Editor() {
 
   const contentWidth = paper.width - 2 * margin;
 
+  const rhythms = useMemo(() => {
+    let meter = chart.time ?? "4/4";
+    return chart.measures.map(measure => {
+      meter = measure.time ?? meter;
+      return measureRhythm(measure, meter);
+    });
+  }, [chart]);
+
+  const fragments = useMemo(() => chart.measures.flatMap(({ events }, measureIndex) => {
+    const starts = [0];
+    events.forEach((_, index) => {
+      if (index > 0 && lyricBreakType(lyricBreaks, lyricPosition(measureIndex, index))) starts.push(index);
+    });
+    return starts.map((start, index): Fragment => ({ measureIndex, start, end: starts[index + 1] ?? events.length }));
+  }), [chart, lyricBreaks]);
+
+  function hasRehearsalBreak(index: number) {
+    return index > 0 && Boolean(chart.measures[index]?.section.length);
+  }
+
+  function measureBreak(index: number): BreakType | undefined {
+    const override = breaks[index];
+    return override === "none" ? undefined : override ?? (hasRehearsalBreak(index) ? "line" : undefined);
+  }
+
+  function setMeasureBreak(index: number, type?: BreakType) {
+    setBreaks(previous => {
+      const next = { ...previous };
+      if (type) next[index] = type;
+      else if (hasRehearsalBreak(index)) next[index] = "none";
+      else delete next[index];
+      return next;
+    });
+  }
+
   const rows = useMemo(() => {
     const result: Row[] = [];
     let row: Row | undefined;
     let used = 0;
-    for (const [index, measure] of chart.measures.entries()) {
-      const width = Math.min(contentWidth, measureWidths[index] ?? 150);
+    for (const [index, fragment] of fragments.entries()) {
+      const { measureIndex, start } = fragment;
+      const forced = start > 0 || measureBreak(measureIndex);
+      const width = measureWidths[index] ?? 150;
       const atLimit = settings.perLine > 0 && row?.widths.length === settings.perLine;
-      if (!row || atLimit || used + width > contentWidth || measure.section.length || breaks[index]) {
+      if (!row || atLimit || used + width > contentWidth || forced) {
         row = { start: index, widths: [] };
         result.push(row);
         used = 0;
@@ -66,14 +176,22 @@ export default function Editor() {
       used += width;
     }
     return result;
-  }, [chart, breaks, contentWidth, measureWidths, settings.perLine]);
+  }, [chart, fragments, breaks, contentWidth, measureWidths, settings.perLine]);
 
   useLayoutEffect(() => {
     const probe = widthProbe.current;
     if (!probe) return;
-    // Round up and leave room for the closing barline on any measure.
-    setMeasureWidths(Array.from(probe.children, element => Math.ceil(element.getBoundingClientRect().width) + 1));
-  }, [chart, verse, shift, preferFlats, settings.chordSize, settings.lyricSize, settings.cues, settings.numbers]);
+    const measure = () => {
+      // Round up and leave room for the closing barline on any measure.
+      const widths = Array.from(probe.children, element => Math.ceil(element.getBoundingClientRect().width) + 1);
+      setMeasureWidths(previous => previous.length === widths.length &&
+        previous.every((width, index) => width === widths[index]) ? previous : widths);
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    Array.from(probe.children).forEach(element => observer.observe(element));
+    return () => observer.disconnect();
+  }, [fragments, verse, shift, preferFlats, settings.chordSize, settings.lyricSize, settings.cues, settings.numbers]);
 
   useLayoutEffect(() => {
     const canvasElement = canvas.current;
@@ -93,7 +211,12 @@ export default function Editor() {
       let used = header;
       const capacity = paper.height - 2 * margin - 32;
       rows.forEach((row, index) => {
-        if (pages.at(-1)!.length && (breaks[row.start] === "page" || used + heights[index] > capacity)) {
+        const fragment = fragments[row.start];
+        const breakType = fragment.start === 0
+          ? breaks[fragment.measureIndex]
+          : lyricBreakType(lyricBreaks, lyricPosition(fragment.measureIndex, fragment.start));
+        const newPage = breakType === "page";
+        if (pages.at(-1)!.length && (newPage || used + heights[index] > capacity)) {
           pages.push([]);
           used = 34;
         }
@@ -106,13 +229,53 @@ export default function Editor() {
     const observer = new ResizeObserver(paginate);
     observer.observe(root);
     return () => observer.disconnect();
-  }, [rows, breaks, paper, margin, chart, target, verse, settings]);
+  }, [rows, fragments, breaks, lyricBreaks, paper, margin, chart, target, verse, settings]);
+
+  useLayoutEffect(() => {
+    if (!restoreLyricFocus.current || !selectedLyric) return;
+    const dot = canvas.current?.querySelector<HTMLButtonElement>(`.sheet [data-lyric-dot="${selectedLyric}"]`);
+    if (dot) {
+      dot.focus();
+      restoreLyricFocus.current = false;
+    }
+  }, [pageRows, selectedLyric]);
+
+  function editLyricBreak(event: KeyboardEvent<HTMLButtonElement>, position: string) {
+    if (position === "0:0") return;
+    const enter = event.key === "Enter";
+    if (!enter && event.key !== "Backspace" && event.key !== "Delete") return;
+    event.preventDefault();
+    if (event.repeat) return;
+    setSelectedLyric(position);
+
+    const [measureIndex, eventIndex] = position.split(":").map(Number);
+    const atBarline = eventIndex === 0;
+    const current = atBarline ? measureBreak(measureIndex) : lyricBreakType(lyricBreaks, position);
+    const pageBreak = enter && (event.metaKey || event.ctrlKey);
+    const nextType = pageBreak ? "page" : enter && !current ? "line" : undefined;
+    if (nextType === current) return;
+
+    restoreLyricFocus.current = true;
+    if (atBarline) {
+      setMeasureBreak(measureIndex, nextType);
+    } else {
+      setLyricBreaks(previous => {
+        const next = new Set(previous);
+        next.delete(position);
+        next.delete(position + ":page");
+        if (nextType) next.add(nextType === "page" ? position + ":page" : position);
+        return next;
+      });
+    }
+  }
 
   function load(next: Chart) {
     setChart(next);
     setTarget("");
     setVerse("");
     setBreaks({});
+    setLyricBreaks(new Set());
+    setSelectedLyric(undefined);
     setBoundary("1");
   }
 
@@ -141,7 +304,10 @@ export default function Editor() {
   const chartStyle = {
     "--paper-width": paper.width + "px", "--paper-height": paper.height + "px",
     "--margin": margin + "px", "--lyric-size": settings.lyricSize + "px",
-    "--chord-size": settings.chordSize + "px", "--fit": fit
+    "--chord-size": settings.chordSize + "px", "--fit": fit,
+    "--measure-color": settings.measureColor ?? chartColors.measureColor,
+    "--chord-color": settings.chordColor ?? chartColors.chordColor,
+    "--lyric-color": settings.lyricColor ?? chartColors.lyricColor
   } as CSSProperties;
 
   function chartHeader() {
@@ -156,43 +322,96 @@ export default function Editor() {
     </div>;
   }
 
-  function renderMeasure(measure: Measure, index: number) {
+  function renderMeasure({ measureIndex: index, start, end }: Fragment, interactive = false) {
+    const measure = chart.measures[index];
+    const first = start === 0;
+    const last = end === measure.events.length;
+    const rhythm = rhythms[index];
+    const fragmentStart = first ? -Infinity : measure.events[start].beat;
+    const fragmentEnd = last ? Infinity : measure.events[end].beat;
+    const slots = rhythm.slots.filter(({ beat }) => beat >= fragmentStart && beat < fragmentEnd);
     const verses = verse ? [verse] : chart.verses.filter(id => measure.events.some(event => event.lyrics[id]));
-    return <div className="measure" key={index} data-measure={measure.number}>
+    const showTicks = beatTicks === "always" || (beatTicks === "without-lyrics" &&
+      !measure.events.some(event => verses.some(id => event.lyrics[id])));
+    const barPosition = lyricPosition(index, 0);
+    const barSelected = selectedLyric === barPosition;
+    const barBreak = measureBreak(index);
+    return <div className="measure" key={lyricPosition(index, start)} data-measure={measure.number} data-continuation={!first || undefined} data-unfinished={!last || undefined}>
       <div className="measure-marks">
-        {measure.section.map((section, i) => <strong className="section-mark" key={i}>{section}</strong>)}
+        {first && (interactive
+          ? <RehearsalMarks marks={measure.section} measure={measure.number} canAdd={barSelected}
+              onChange={section => setChart(previous => ({
+                ...previous,
+                measures: previous.measures.map((item, measureIndex) => measureIndex === index ? { ...item, section } : item)
+              }))} />
+          : measure.section.map((section, i) => <strong className="section-mark" key={i}>{section}</strong>))}
         {measure.ending && <span className="ending">{measure.ending}</span>}
       </div>
+      <div className="measure-track">
+        {interactive && first &&
+          <button type="button" className="lyric-break-dot barline-break-dot" data-lyric-dot={barPosition}
+            data-break={barBreak || undefined} aria-pressed={barSelected}
+            aria-label={index === 0 ? "Select barline for measure " + measure.number : breakLabel(barBreak) + "measure " + measure.number}
+            onClick={() => setSelectedLyric(barPosition)} onKeyDown={key => editLyricBreak(key, barPosition)} />}
+      </div>
       <div className="measure-meta">
-        {settings.numbers && <span className="measure-number">{measure.number}</span>}
-        {measure.leftRepeat && <b aria-label="Start repeat">{measure.leftRepeat}</b>}
-        {index > 0 && measure.time && <b>{measure.time}</b>}
-        {index > 0 && measure.key && <b>Key {transpose(measure.key.tonic, shift, preferFlats)}{measure.key.mode === "minor" ? "m" : ""}</b>}
-        {measure.rightRepeat && <b className="end-repeat" aria-label={"End repeat " + measure.rightRepeat}>{measure.rightRepeat}</b>}
+        {first && measure.leftRepeat && <span className="repeat-bar repeat-start" role="img" aria-label="Start repeat" />}
+        {first && settings.numbers && <span className="measure-number">{measure.number}</span>}
+        {first && index > 0 && measure.time && <b>{measure.time}</b>}
+        {first && index > 0 && measure.key && <b>Key {transpose(measure.key.tonic, shift, preferFlats)}{measure.key.mode === "minor" ? "m" : ""}</b>}
       </div>
+      {last && measure.rightRepeat && <span className="repeat-bar repeat-end" role="img"
+          aria-label={"End repeat " + measure.rightRepeat}>
+          {measure.rightRepeat.replace(/^𝄇\s*/, "")}
+        </span>}
       <div className="events">
-        {measure.events.map(event => <div className="event" key={event.beat}>
-          <div className="chord">{event.chord && chordText(event.chord, shift, preferFlats)}</div>
-          {verses.map(id => <div className="lyric" key={id}>{event.lyrics[id]}</div>)}
-        </div>)}
+        <div className="event-flow">
+          {slots.map(({ beat, slash, eventIndex }, slotIndex) => {
+            const event = eventIndex === undefined ? undefined : measure.events[eventIndex];
+            const position = eventIndex === undefined ? "" : lyricPosition(index, eventIndex);
+            const nextBeat = slots[slotIndex + 1]?.beat ?? (last ? rhythm.duration : fragmentEnd);
+            const space = Math.max(8, Math.min(24, (nextBeat - beat) * 24));
+            const lyricBreak = lyricBreakType(lyricBreaks, position);
+            const selected = selectedLyric === position;
+            const lyric = verses.map(id => event?.lyrics[id]).find(Boolean);
+            const atBarline = eventIndex === 0;
+            const editable = interactive && position !== "0:0" && Boolean(lyric || lyricBreak);
+            return <div className="event" key={beat} style={{ "--beat-space": space + "px" } as CSSProperties}
+              data-lyric-selected={selected || undefined} data-at-barline={atBarline || undefined}>
+              {editable && !atBarline && <button type="button" className="lyric-break-dot" data-lyric-dot={position}
+                data-break={lyricBreak} aria-pressed={selected}
+                aria-label={breakLabel(lyricBreak) + (lyric || "this beat")}
+                onClick={() => setSelectedLyric(position)} onKeyDown={key => editLyricBreak(key, position)} />}
+              <div className="chord">{event?.chord && chordText(event.chord, shift, preferFlats)}</div>
+              {showTicks && slash && <span className="beat-slash" aria-hidden="true">/</span>}
+              {verses.map(id => <div className="lyric" key={id}>
+                {editable && event?.lyrics[id]
+                  ? <button type="button" className="lyric-control" aria-pressed={selected}
+                      onClick={() => setSelectedLyric(position)} onKeyDown={key => editLyricBreak(key, position)}>
+                      {event.lyrics[id]}
+                    </button>
+                  : event?.lyrics[id]}
+              </div>)}
+            </div>;
+          })}
+        </div>
       </div>
-      {settings.cues && measure.cues.length > 0 && <div className="cues">{measure.cues.join(" · ")}</div>}
+      {last && settings.cues && measure.cues.length > 0 && <div className="cues">{measure.cues.join(" · ")}</div>}
     </div>;
   }
 
-  function renderRow(row: Row) {
+  function renderRow(row: Row, interactive = false) {
     return <div className="chart-row" key={row.start}>
       <div className="measure-grid" style={{ gridTemplateColumns: row.widths.map(width => width + "px").join(" ") }}>
         {row.widths.map((_, column) => {
-          const index = row.start + column;
-          const measure = chart.measures[index];
-          return measure && renderMeasure(measure, index);
+          const fragment = fragments[row.start + column];
+          return fragment && renderMeasure(fragment, interactive);
         })}
       </div>
     </div>;
   }
 
-  const pages = pageRows.length ? pageRows : [rows];
+  const pages = pageRows[0]?.[0] === rows[0] ? pageRows : [rows];
 
   return <div className="app">
     <header className="topbar">
@@ -239,9 +458,39 @@ export default function Editor() {
               {[10,11,12,13,14,15,16,18].map(value => <option key={value} value={value}>{value} px</option>)}
             </Select>
           </div>
+          <Select label="Beat ticks" value={beatTicks} onChange={value => setting("beatTicks", value as BeatTicks)}>
+            <option value="always">Always</option>
+            <option value="never">Never</option>
+            <option value="without-lyrics">Only in bars without lyrics</option>
+          </Select>
           <Select label="Print margins" value={settings.margin} onChange={value => setting("margin", Number(value))}>
             <option value="0.4">Narrow · 0.4″</option><option value="0.55">Standard · 0.55″</option><option value="0.75">Wide · 0.75″</option>
           </Select>
+          <fieldset className="chart-colors">
+            <legend>Chart colors</legend>
+            {([
+              ["measureColor", "Measures, repeats, and cues"],
+              ["chordColor", "Chords"],
+              ["lyricColor", "Lyrics"]
+            ] as const).map(([key, label]) => {
+              const color = settings[key] ?? chartColors[key];
+              return <div className="color-setting" key={key}>
+                <label htmlFor={key}>{label}</label>
+                <div className="color-inputs">
+                  <input id={key} type="color" value={color} onInput={event => setting(key, event.currentTarget.value)} />
+                  <input key={color} type="text" aria-label={label + " hex color"} defaultValue={color}
+                    maxLength={7} spellCheck={false}
+                    onBlur={event => {
+                      const hex = event.currentTarget.value.trim().replace(/^#/, "");
+                      const updated = /^[0-9a-f]{6}$/i.test(hex) ? "#" + hex.toLowerCase() : color;
+                      event.currentTarget.value = updated;
+                      setting(key, updated);
+                    }}
+                    onKeyDown={event => { if (event.key === "Enter") event.currentTarget.blur(); }} />
+                </div>
+              </div>;
+            })}
+          </fieldset>
           <div className="toggles">
             <Field className="toggle"><Checkbox className="check" checked={settings.numbers} onChange={value => setting("numbers", value)}>{settings.numbers && <Check size={13} />}</Checkbox><Label>Measure numbers</Label></Field>
             <Field className="toggle"><Checkbox className="check" checked={settings.cues} onChange={value => setting("cues", value)}>{settings.cues && <Check size={13} />}</Checkbox><Label>Performance cues</Label></Field>
@@ -250,32 +499,33 @@ export default function Editor() {
 
         <section className="panel breaks-panel">
           <h2><Scissors size={17} /> Breaks</h2>
+          <p className="break-help">Select a lyric or barline. Press Enter for a line break or Command/Ctrl + Enter for a page break. Press Enter, Backspace, or Delete on a solid dot to remove the break.</p>
           {chart.measures.length > 1 && <div className="settings-grid">
             <Select label="Before measure" value={boundary} onChange={setBoundary}>
-              {chart.measures.slice(1).map((measure, index) => <option value={index + 1} key={index}>{measure.number}{breaks[index + 1] ? " · " + breaks[index + 1] : ""}</option>)}
+              {chart.measures.slice(1).map((measure, index) => {
+                const type = measureBreak(index + 1);
+                return <option value={index + 1} key={index}>{measure.number}{type ? " · " + type : ""}</option>;
+              })}
             </Select>
-            <Select label="Break type" value={breaks[Number(boundary)] || ""} onChange={value => {
-              setBreaks(previous => {
-                const next = { ...previous };
-                if (value === "line" || value === "page") next[Number(boundary)] = value;
-                else delete next[Number(boundary)];
-                return next;
-              });
+            <Select label="Break type" value={measureBreak(Number(boundary)) || ""} onChange={value => {
+              setMeasureBreak(Number(boundary), value === "line" || value === "page" ? value : undefined);
             }}>
               <option value="">Automatic</option><option value="line">New line</option><option value="page">New page</option>
             </Select>
           </div>}
-          <Button className="reset-button" onClick={() => { setSettings(initial); setBreaks({}); }}><RotateCcw size={14} /> Reset layout</Button>
+          <Button className="reset-button" onClick={() => { setSettings(initial); setBreaks({}); setLyricBreaks(new Set()); setSelectedLyric(undefined); }}><RotateCcw size={14} /> Reset layout</Button>
         </section>
       </aside>
       <main className="preview" style={chartStyle}>
         <div className="preview-bar"><strong>Chart preview</strong><span>{chart.measures.length} measures <span className="separator">·</span> {pages.length} {pages.length === 1 ? "page" : "pages"}</span></div>
         <div className="canvas" ref={canvas}>
-          <div className="measurement" ref={measurement} aria-hidden="true">{chartHeader()}{rows.map(renderRow)}<div ref={widthProbe} className="measure-widths">{chart.measures.map(renderMeasure)}</div></div>
-          <div className="sheets">
-            {pages.map((page, index) => <article className="sheet" key={index} aria-label={"Page " + (index + 1)}>
+          <div className="measurement" ref={measurement} aria-hidden="true">{chartHeader()}{rows.map(row => renderRow(row))}<div ref={widthProbe} className="measure-widths">{fragments.map(fragment => renderMeasure(fragment))}</div></div>
+          <div className="sheets" data-overwide={measureWidths.some(width => width > contentWidth) || undefined}>
+            {pages.map((page, index) => <article className="sheet" key={index} aria-label={"Page " + (index + 1)}
+              style={{ "--preview-page-width": Math.max(paper.width, ...page.map(row =>
+                row.widths.reduce((sum, width) => sum + width, 0) + 2 * margin)) + "px" } as CSSProperties}>
               {index === 0 ? chartHeader() : <div className="continuation">{chart.title}</div>}
-              {page.map(renderRow)}
+              {page.map(row => renderRow(row, true))}
               <footer><span>{chart.title}</span><span>{index + 1} / {pages.length}</span></footer>
             </article>)}
           </div>

@@ -3,7 +3,7 @@ export type Key = { tonic: string; mode: string };
 export type Event = { beat: number; chord?: Chord; lyrics: Record<string, string> };
 export type Measure = {
   number: string; events: Event[]; section: string[]; cues: string[];
-  time?: string; key?: Key; leftRepeat?: string; rightRepeat?: string; ending?: string;
+  time?: string; pickupDuration?: number; key?: Key; leftRepeat?: string; rightRepeat?: string; ending?: string;
 };
 export type Chart = {
   title: string; credit: string; key?: Key; time?: string; measures: Measure[];
@@ -67,6 +67,42 @@ function readChord(node: Element): Chord | undefined {
   return { root: symbol, suffix, bass: bass ? value(bass, "bass-step") + accidental(value(bass, "bass-alter")) : undefined };
 }
 
+type LyricSyllable = { event: Event; text: string; syllabic: string; voice: string };
+
+function joinLyricWords(measures: Measure[], syllables: Map<Event, Map<string, LyricSyllable>>) {
+  const pending = new Map<string, LyricSyllable[]>();
+  for (const measure of measures) {
+    for (const event of measure.events) {
+      for (const [verse, syllable] of syllables.get(event) ?? []) {
+        const { text, syllabic, voice } = syllable;
+        const stream = JSON.stringify([verse, voice]);
+        const word = pending.get(stream);
+        const continues = syllabic === "begin" || syllabic === "middle" ||
+          (!syllabic && /^-?\p{L}[\p{L}\p{M}’']*[-‐\u00ad]$/u.test(text));
+        const canJoin = syllabic === "middle" || syllabic === "end" ||
+          (!syllabic && /^[-‐\u00ad]?\p{L}/u.test(text));
+
+        if (word && canJoin) {
+          word.push(syllable);
+          if (continues) continue;
+
+          const [first, ...rest] = word;
+          first.event.lyrics[verse] = word.map((part, index) => {
+            let fragment = part.text;
+            if (index > 0) fragment = fragment.replace(/^[-‐\u00ad]/u, "");
+            if (index < word.length - 1) fragment = fragment.replace(/[-‐\u00ad]$/u, "");
+            return fragment;
+          }).join("");
+          for (const part of rest) delete part.event.lyrics[verse];
+        }
+
+        pending.delete(stream);
+        if (continues && syllabic !== "middle") pending.set(stream, [syllable]);
+      }
+    }
+  }
+}
+
 export function parseMusicXML(xml: string, requestedPart?: string): Chart {
   const document = new DOMParser().parseFromString(xml, "application/xml");
   if (document.getElementsByTagName("parsererror").length) throw new Error("This file contains invalid XML.");
@@ -75,11 +111,13 @@ export function parseMusicXML(xml: string, requestedPart?: string): Chart {
   const scoreParts = all(score, "part");
   const names = new Map(all(child(score, "part-list"), "score-part").map(part => [part.getAttribute("id"), value(part, "part-name")]));
   const id = (part: Element) => part.getAttribute("id") ?? "";
-  const weight = (part: Element) => part.getElementsByTagName("harmony").length * 3 + part.getElementsByTagName("lyric").length;
+  const harmonyCount = (part: Element) => part.getElementsByTagName("harmony").length;
+  const weight = (part: Element) => harmonyCount(part) * 3 + part.getElementsByTagName("lyric").length;
   const part = scoreParts.find(part => id(part) === requestedPart) ??
     [...scoreParts].sort((a, b) => weight(b) - weight(a))[0];
   if (!part || !all(part, "measure").length) throw new Error("This score has no measures.");
   const verses = new Set<string>();
+  const syllables = new Map<Event, Map<string, LyricSyllable>>();
   let divisions = 1;
   let activeEnding: string | undefined;
   let previousKey: Key | undefined;
@@ -89,6 +127,7 @@ export function parseMusicXML(xml: string, requestedPart?: string): Chart {
     const events = new Map<number, Event>();
     let position = 0;
     let lastNote = 0;
+    let duration = 0;
     const eventAt = (beat: number) => {
       const rounded = Math.round(beat * 10000) / 10000;
       const event = events.get(rounded) ?? { beat: rounded, lyrics: Object.create(null) as Record<string, string> };
@@ -135,12 +174,19 @@ export function parseMusicXML(xml: string, requestedPart?: string): Chart {
             if (!text) continue;
             const verse = lyric.getAttribute("number") || lyric.getAttribute("name") || "1";
             const syllabic = value(lyric, "syllabic");
-            eventAt(start).lyrics[verse] ??= text + (["begin","middle"].includes(syllabic) ? "-" : "");
+            const event = eventAt(start);
+            if (event.lyrics[verse] !== undefined) continue;
+            const continues = syllabic === "begin" || syllabic === "middle";
+            event.lyrics[verse] = continues && !/[-‐\u00ad]$/u.test(text) ? text + "-" : text;
+            const eventSyllables = syllables.get(event) ?? new Map<string, LyricSyllable>();
+            eventSyllables.set(verse, { event, text, syllabic, voice: value(node, "voice") || "1" });
+            syllables.set(event, eventSyllables);
             verses.add(verse);
           }
           if (!simultaneous) {
             lastNote = start;
             position += Number(value(node, "duration")) / divisions;
+            duration = Math.max(duration, position);
           }
           break;
         }
@@ -175,9 +221,36 @@ export function parseMusicXML(xml: string, requestedPart?: string): Chart {
         }
       }
     }
+    if (element.getAttribute("implicit") === "yes" && duration > 0) measure.pickupDuration = duration;
     measure.events = [...events.values()].sort((a, b) => a.beat - b.beat);
     return measure;
   });
+  joinLyricWords(measures, syllables);
+  if (!harmonyCount(part)) {
+    const donor = [...scoreParts].sort((a, b) => harmonyCount(b) - harmonyCount(a))[0];
+    if (donor && harmonyCount(donor) && all(donor, "measure").length &&
+        scoreParts.find(candidate => id(candidate) === id(donor)) === donor) {
+      const chordMeasures = parseMusicXML(xml, id(donor)).measures;
+      const chordMeasuresByNumber = new Map<string, Measure | undefined>();
+      for (const measure of chordMeasures) {
+        chordMeasuresByNumber.set(measure.number, chordMeasuresByNumber.has(measure.number) ? undefined : measure);
+      }
+      measures.forEach((measure, index) => {
+        const source = chordMeasures[index]?.number === measure.number
+          ? chordMeasures[index]
+          : chordMeasuresByNumber.get(measure.number);
+        if (!source) return;
+        const events = new Map(measure.events.map(event => [event.beat, event]));
+        for (const { beat, chord } of source.events) {
+          if (!chord) continue;
+          const event = events.get(beat);
+          if (event) event.chord = chord;
+          else events.set(beat, { beat, chord, lyrics: Object.create(null) });
+        }
+        measure.events = [...events.values()].sort((a, b) => a.beat - b.beat);
+      });
+    }
+  }
   return {
     title: value(child(score, "work"), "work-title") || value(score, "movement-title") || "Untitled score",
     credit: value(child(score, "identification"), "creator"),
