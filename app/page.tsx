@@ -1,19 +1,56 @@
 "use client";
 
-import { Button, Checkbox, Field, Label } from "@headlessui/react";
-import { Check, ChevronDown, FileMusic, FileUp, Music2, Printer, RotateCcw, Scissors, SlidersHorizontal } from "lucide-react";
+import { Button, Checkbox, Field, Label, Popover, PopoverButton, PopoverGroup, PopoverPanel } from "@headlessui/react";
+import { Check, ChevronDown, FileUp, CircleHelp, Music2, Palette, Printer, RotateCcw, SlidersHorizontal } from "lucide-react";
 import { type ChangeEvent, type CSSProperties, type KeyboardEvent, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { demo } from "../lib/demo";
 import { type Chart, type Chord, type Measure, keys, parseMusicXML, pitch, transpose } from "../lib/music";
 
 const paperSizes = { letter: { width: 816, height: 1056, css: "letter" }, a4: { width: 793.7, height: 1122.5, css: "A4" } };
 type BeatTicks = "always" | "never" | "without-lyrics";
-const chartColors = { measureColor: "#666666", chordColor: "#000000", lyricColor: "#333333" };
-const initial = { ...chartColors, beatTicks: "without-lyrics" as BeatTicks, perLine: 0, lyricSize: 13, chordSize: 16, margin: 0.55, paper: "letter" as keyof typeof paperSizes, numbers: true, cues: true };
+const chartColors = { measureColor: "#666666", chordColor: "#000000", lyricColor: "#333333", rehearsalColor: "#666666", cueColor: "#666666" };
+const initial = { ...chartColors, beatTicks: "without-lyrics" as BeatTicks, lyricSize: 13, chordSize: 16, rehearsalSize: 12, cueSize: 11, margin: 0.55, paper: "letter" as keyof typeof paperSizes, numbers: true, cues: true };
 
 type Row = { start: number; widths: number[] };
-type Fragment = { measureIndex: number; start: number; end: number };
+type MeasureLayout = { width: number; slots: number[] };
+
+function readMeasureLayout(measure: Element): MeasureLayout {
+  const flow = measure.querySelector<HTMLElement>(".event-flow")!;
+  const events = Array.from(flow.children);
+  const laneEnds: number[] = [];
+  const starts: number[] = [];
+  let nextBeat = 0;
+  let contentEnd = 0;
+
+  for (const event of events) {
+    const widths = Array.from(event.querySelectorAll(".chord, .lyric"), lane => lane.getBoundingClientRect().width);
+    let start = nextBeat;
+    widths.forEach((width, lane) => {
+      if (width > 0) start = Math.max(start, laneEnds[lane] ?? 0);
+    });
+    widths.forEach((width, lane) => {
+      if (width === 0) return;
+      laneEnds[lane] = start + width + 5;
+      contentEnd = Math.max(contentEnd, laneEnds[lane]);
+    });
+    starts.push(start);
+    nextBeat = start + Number(event.getAttribute("data-beat-space"));
+  }
+
+  const end = Math.max(nextBeat, contentEnd);
+  const slots = starts.map((start, index) => (starts[index + 1] ?? end) - start);
+  const meta = measure.querySelector(".measure-meta")!.getBoundingClientRect().width;
+  const repeat = measure.querySelector(".repeat-end")?.getBoundingClientRect().width ?? 0;
+  const padding = getComputedStyle(flow);
+  const rhythmWidth = end + meta + repeat + parseFloat(padding.paddingLeft) + parseFloat(padding.paddingRight);
+  // Round up and leave room for the closing barline.
+  return { width: Math.ceil(Math.max(measure.getBoundingClientRect().width, rhythmWidth)) + 1, slots };
+}
+
+type Fragment = { measureIndex: number; start: number; end: number; continuation: boolean };
 const lyricPosition = (measure: number, event: number) => measure + ":" + event;
+const eventPosition = (measure: number, event: number, beat: number) =>
+  beat === 0 ? lyricPosition(measure, 0) : lyricPosition(measure, event) + (event === 0 ? ":offbeat" : "");
 type BreakType = "line" | "page";
 const lyricBreakType = (breaks: ReadonlySet<string>, position: string): BreakType | undefined =>
   breaks.has(position + ":page") ? "page" : breaks.has(position) ? "line" : undefined;
@@ -42,16 +79,40 @@ function measureRhythm(measure: Measure, meter: string) {
   return { slots: [...slots.values()].sort((a, b) => a.beat - b.beat), duration: measure.pickupDuration ?? duration };
 }
 
-function chordText(chord: Chord, shift: number, flats: boolean) {
-  return transpose(chord.root, shift, flats) + chord.suffix + (chord.bass ? "/" + transpose(chord.bass, shift, flats) : "");
+function renderChordNote(note: string) {
+  const match = /^([A-G])([♭♯]+)$/.exec(note);
+  return match ? <>{match[1]}<span className="chord-accidental" data-flat={match[2].startsWith("♭") || undefined}>{match[2]}</span></> : note;
 }
 
-function Select({ label, value, onChange, children }: {
-  label: string; value: string | number; onChange: (value: string) => void; children: React.ReactNode;
+function renderChord(chord: Chord, shift: number, flats: boolean) {
+  const minor = /^m(?!aj)/.test(chord.suffix) ? "m" : "";
+  const detail = chord.suffix.slice(minor.length);
+  return <>
+    {renderChordNote(transpose(chord.root, shift, flats))}{minor}
+    {detail && <sup className="chord-detail">{detail}</sup>}
+    {chord.bass && <>/{renderChordNote(transpose(chord.bass, shift, flats))}</>}
+  </>;
+}
+
+function Select({ label, value, onChange, children, inline = false }: {
+  label: string; value: string | number; onChange: (value: string) => void; children: React.ReactNode; inline?: boolean;
 }) {
-  return <label className="setting"><span>{label}</span><span className="select-wrap">
+  return <label className={inline ? "setting setting-inline" : "setting"}><span>{label}</span><span className="select-wrap">
     <select value={value} onChange={event => onChange(event.target.value)}>{children}</select><ChevronDown size={15} />
   </span></label>;
+}
+
+function ChartFlyout({ label, icon, iconOnly = false, children }: {
+  label: string; icon: React.ReactNode; iconOnly?: boolean; children: React.ReactNode;
+}) {
+  return <Popover>
+    <PopoverButton className="toolbar-button" aria-label={label}>
+      {icon}{!iconOnly && <>{label}<ChevronDown size={13} /></>}
+    </PopoverButton>
+    <PopoverPanel anchor={{ to: "bottom end", gap: 8, padding: 12 }} className="toolbar-flyout">
+      {children}
+    </PopoverPanel>
+  </Popover>;
 }
 
 function RehearsalMarks({ marks, measure, canAdd, onChange }: {
@@ -62,34 +123,41 @@ function RehearsalMarks({ marks, measure, canAdd, onChange }: {
   function save() {
     if (!edit) return;
     const text = edit.text.trim();
-    if (!text) return;
+    setEdit(undefined);
+    if (!text || marks[edit.index] === text) return;
     const next = [...marks];
     next[edit.index] = text;
-    setEdit(undefined);
     onChange(next);
   }
 
-  return <>
+  return <div className="rehearsal-marks-editor" onBlur={event => {
+    if (!event.currentTarget.contains(event.relatedTarget)) save();
+  }}>
     {marks.map((mark, index) => <span className="section-mark" key={index}>
       <button type="button" className="rehearsal-label" aria-label={"Edit rehearsal mark " + mark}
         onClick={() => setEdit({ index, text: mark })}>{mark}</button>
-      <button type="button" className="rehearsal-remove" aria-label={"Remove rehearsal mark " + mark}
-        onClick={() => {
-          setEdit(undefined);
-          onChange(marks.filter((_, markIndex) => markIndex !== index));
-        }}>×</button>
     </span>)}
     {(canAdd || edit) && <div className="rehearsal-actions">
-      {edit ? <input className="rehearsal-field" aria-label={"Rehearsal mark for measure " + measure}
-        autoFocus value={edit.text} onChange={event => setEdit({ ...edit, text: event.target.value })}
-        onKeyDown={event => {
-          if (event.key === "Enter") { event.preventDefault(); save(); }
-          if (event.key === "Escape") { event.preventDefault(); setEdit(undefined); }
-        }} />
-        : <button type="button" className="rehearsal-add"
-            onClick={() => setEdit({ index: marks.length, text: "" })}>Add rehearsal mark</button>}
+      {edit ? <>
+        <input className="rehearsal-field" aria-label={"Rehearsal mark for measure " + measure}
+          autoFocus value={edit.text} onChange={event => setEdit({ ...edit, text: event.target.value })}
+          onKeyDown={event => {
+            if (event.key === "Enter") { event.preventDefault(); save(); }
+            if (event.key === "Escape") { event.preventDefault(); setEdit(undefined); }
+          }} />
+        {edit.index < marks.length && <button type="button" className="rehearsal-remove"
+          aria-label={"Remove rehearsal mark " + marks[edit.index]}
+          onKeyDown={event => { if (event.key === "Escape") setEdit(undefined); }}
+          onPointerDown={event => event.preventDefault()}
+          onClick={() => {
+            const index = edit.index;
+            setEdit(undefined);
+            onChange(marks.filter((_, markIndex) => markIndex !== index));
+          }}>×</button>}
+      </> : <button type="button" className="rehearsal-add"
+        onClick={() => setEdit({ index: marks.length, text: "" })}>Add rehearsal mark</button>}
     </div>}
-  </>;
+  </div>;
 }
 
 export default function Editor() {
@@ -104,9 +172,8 @@ export default function Editor() {
   const [lyricBreaks, setLyricBreaks] = useState<Set<string>>(() => new Set());
   const [selectedLyric, setSelectedLyric] = useState<string>();
   const restoreLyricFocus = useRef(false);
-  const [boundary, setBoundary] = useState("1");
   const [fit, setFit] = useState(1);
-  const [measureWidths, setMeasureWidths] = useState<number[]>([]);
+  const [measureLayouts, setMeasureLayouts] = useState<MeasureLayout[]>([]);
   const [pageRows, setPageRows] = useState<Row[][]>([]);
   const xml = useRef("");
   const upload = useRef<HTMLInputElement>(null);
@@ -133,10 +200,12 @@ export default function Editor() {
 
   const fragments = useMemo(() => chart.measures.flatMap(({ events }, measureIndex) => {
     const starts = [0];
-    events.forEach((_, index) => {
-      if (index > 0 && lyricBreakType(lyricBreaks, lyricPosition(measureIndex, index))) starts.push(index);
+    events.forEach(({ beat }, index) => {
+      if (beat !== 0 && lyricBreakType(lyricBreaks, eventPosition(measureIndex, index, beat))) starts.push(index);
     });
-    return starts.map((start, index): Fragment => ({ measureIndex, start, end: starts[index + 1] ?? events.length }));
+    return starts.map((start, index): Fragment => ({
+      measureIndex, start, end: starts[index + 1] ?? events.length, continuation: index > 0
+    }));
   }), [chart, lyricBreaks]);
 
   function hasRehearsalBreak(index: number) {
@@ -163,11 +232,10 @@ export default function Editor() {
     let row: Row | undefined;
     let used = 0;
     for (const [index, fragment] of fragments.entries()) {
-      const { measureIndex, start } = fragment;
-      const forced = start > 0 || measureBreak(measureIndex);
-      const width = measureWidths[index] ?? 150;
-      const atLimit = settings.perLine > 0 && row?.widths.length === settings.perLine;
-      if (!row || atLimit || used + width > contentWidth || forced) {
+      const { measureIndex, continuation } = fragment;
+      const forced = continuation || measureBreak(measureIndex);
+      const width = measureLayouts[index]?.width ?? 150;
+      if (!row || used + width > contentWidth || forced) {
         row = { start: index, widths: [] };
         result.push(row);
         used = 0;
@@ -176,22 +244,23 @@ export default function Editor() {
       used += width;
     }
     return result;
-  }, [chart, fragments, breaks, contentWidth, measureWidths, settings.perLine]);
+  }, [chart, fragments, breaks, contentWidth, measureLayouts]);
 
   useLayoutEffect(() => {
     const probe = widthProbe.current;
     if (!probe) return;
     const measure = () => {
-      // Round up and leave room for the closing barline on any measure.
-      const widths = Array.from(probe.children, element => Math.ceil(element.getBoundingClientRect().width) + 1);
-      setMeasureWidths(previous => previous.length === widths.length &&
-        previous.every((width, index) => width === widths[index]) ? previous : widths);
+      const layouts = Array.from(probe.children, readMeasureLayout);
+      setMeasureLayouts(previous => previous.length === layouts.length &&
+        previous.every((layout, index) => layout.width === layouts[index].width &&
+          layout.slots?.length === layouts[index].slots.length &&
+          layout.slots.every((width, slot) => width === layouts[index].slots[slot])) ? previous : layouts);
     };
     measure();
     const observer = new ResizeObserver(measure);
-    Array.from(probe.children).forEach(element => observer.observe(element));
+    probe.querySelectorAll(".measure, .chord, .lyric").forEach(element => observer.observe(element));
     return () => observer.disconnect();
-  }, [fragments, verse, shift, preferFlats, settings.chordSize, settings.lyricSize, settings.cues, settings.numbers]);
+  }, [fragments, verse, shift, preferFlats, settings.chordSize, settings.lyricSize, settings.rehearsalSize, settings.cueSize, settings.cues, settings.numbers]);
 
   useLayoutEffect(() => {
     const canvasElement = canvas.current;
@@ -212,9 +281,10 @@ export default function Editor() {
       const capacity = paper.height - 2 * margin - 32;
       rows.forEach((row, index) => {
         const fragment = fragments[row.start];
-        const breakType = fragment.start === 0
-          ? breaks[fragment.measureIndex]
-          : lyricBreakType(lyricBreaks, lyricPosition(fragment.measureIndex, fragment.start));
+        const { measureIndex, start, continuation } = fragment;
+        const breakType = continuation
+          ? lyricBreakType(lyricBreaks, eventPosition(measureIndex, start, chart.measures[measureIndex].events[start].beat))
+          : breaks[measureIndex];
         const newPage = breakType === "page";
         if (pages.at(-1)!.length && (newPage || used + heights[index] > capacity)) {
           pages.push([]);
@@ -248,8 +318,9 @@ export default function Editor() {
     if (event.repeat) return;
     setSelectedLyric(position);
 
-    const [measureIndex, eventIndex] = position.split(":").map(Number);
-    const atBarline = eventIndex === 0;
+    const [measure, eventIndex, offbeat] = position.split(":");
+    const measureIndex = Number(measure);
+    const atBarline = eventIndex === "0" && !offbeat;
     const current = atBarline ? measureBreak(measureIndex) : lyricBreakType(lyricBreaks, position);
     const pageBreak = enter && (event.metaKey || event.ctrlKey);
     const nextType = pageBreak ? "page" : enter && !current ? "line" : undefined;
@@ -276,7 +347,6 @@ export default function Editor() {
     setBreaks({});
     setLyricBreaks(new Set());
     setSelectedLyric(undefined);
-    setBoundary("1");
   }
 
   async function readFile(file?: File) {
@@ -307,7 +377,11 @@ export default function Editor() {
     "--chord-size": settings.chordSize + "px", "--fit": fit,
     "--measure-color": settings.measureColor ?? chartColors.measureColor,
     "--chord-color": settings.chordColor ?? chartColors.chordColor,
-    "--lyric-color": settings.lyricColor ?? chartColors.lyricColor
+    "--lyric-color": settings.lyricColor ?? chartColors.lyricColor,
+    "--rehearsal-color": settings.rehearsalColor ?? chartColors.rehearsalColor,
+    "--rehearsal-size": (settings.rehearsalSize ?? initial.rehearsalSize) + "px",
+    "--cue-color": settings.cueColor ?? chartColors.cueColor,
+    "--cue-size": (settings.cueSize ?? initial.cueSize) + "px"
   } as CSSProperties;
 
   function chartHeader() {
@@ -322,9 +396,9 @@ export default function Editor() {
     </div>;
   }
 
-  function renderMeasure({ measureIndex: index, start, end }: Fragment, interactive = false) {
+  function renderMeasure({ measureIndex: index, start, end, continuation }: Fragment, interactive = false, layout?: MeasureLayout) {
     const measure = chart.measures[index];
-    const first = start === 0;
+    const first = !continuation;
     const last = end === measure.events.length;
     const rhythm = rhythms[index];
     const fragmentStart = first ? -Infinity : measure.events[start].beat;
@@ -336,7 +410,7 @@ export default function Editor() {
     const barPosition = lyricPosition(index, 0);
     const barSelected = selectedLyric === barPosition;
     const barBreak = measureBreak(index);
-    return <div className="measure" key={lyricPosition(index, start)} data-measure={measure.number} data-continuation={!first || undefined} data-unfinished={!last || undefined}>
+    return <div className="measure" key={first ? barPosition : eventPosition(index, start, measure.events[start].beat)} data-measure={measure.number} data-continuation={!first || undefined} data-unfinished={!last || undefined}>
       <div className="measure-marks">
         {first && (interactive
           ? <RehearsalMarks marks={measure.section} measure={measure.number} canAdd={barSelected}
@@ -368,21 +442,22 @@ export default function Editor() {
         <div className="event-flow">
           {slots.map(({ beat, slash, eventIndex }, slotIndex) => {
             const event = eventIndex === undefined ? undefined : measure.events[eventIndex];
-            const position = eventIndex === undefined ? "" : lyricPosition(index, eventIndex);
+            const position = eventIndex === undefined ? "" : eventPosition(index, eventIndex, beat);
             const nextBeat = slots[slotIndex + 1]?.beat ?? (last ? rhythm.duration : fragmentEnd);
-            const space = Math.max(8, Math.min(24, (nextBeat - beat) * 24));
+            const space = Math.max(0, (nextBeat - beat) * 24);
+            const width = layout?.slots?.[slotIndex] ?? space;
             const lyricBreak = lyricBreakType(lyricBreaks, position);
             const selected = selectedLyric === position;
             const lyric = verses.map(id => event?.lyrics[id]).find(Boolean);
-            const atBarline = eventIndex === 0;
+            const atBarline = beat === 0;
             const editable = interactive && position !== "0:0" && Boolean(lyric || lyricBreak);
-            return <div className="event" key={beat} style={{ "--beat-space": space + "px" } as CSSProperties}
+            return <div className="event" key={beat} style={{ width }} data-beat-space={space}
               data-lyric-selected={selected || undefined} data-at-barline={atBarline || undefined}>
               {editable && !atBarline && <button type="button" className="lyric-break-dot" data-lyric-dot={position}
                 data-break={lyricBreak} aria-pressed={selected}
                 aria-label={breakLabel(lyricBreak) + (lyric || "this beat")}
                 onClick={() => setSelectedLyric(position)} onKeyDown={key => editLyricBreak(key, position)} />}
-              <div className="chord">{event?.chord && chordText(event.chord, shift, preferFlats)}</div>
+              <div className="chord">{event?.chord && renderChord(event.chord, shift, preferFlats)}</div>
               {showTicks && slash && <span className="beat-slash" aria-hidden="true">/</span>}
               {verses.map(id => <div className="lyric" key={id}>
                 {editable && event?.lyrics[id]
@@ -404,8 +479,9 @@ export default function Editor() {
     return <div className="chart-row" key={row.start}>
       <div className="measure-grid" style={{ gridTemplateColumns: row.widths.map(width => width + "px").join(" ") }}>
         {row.widths.map((_, column) => {
-          const fragment = fragments[row.start + column];
-          return fragment && renderMeasure(fragment, interactive);
+          const index = row.start + column;
+          const fragment = fragments[index];
+          return fragment && renderMeasure(fragment, interactive, measureLayouts[index]);
         })}
       </div>
     </div>;
@@ -413,69 +489,85 @@ export default function Editor() {
 
   const pages = pageRows[0]?.[0] === rows[0] ? pageRows : [rows];
 
-  return <div className="app">
+  return <div className="app"
+    onPointerDownCapture={event => {
+      if (selectedLyric && event.target instanceof Element &&
+          !event.target.closest(".lyric-break-dot, .lyric-control, .rehearsal-actions")) {
+        setSelectedLyric(undefined);
+      }
+    }}
+    onKeyDown={event => {
+      if (event.key !== "Escape" || !selectedLyric) return;
+      setSelectedLyric(undefined);
+      if (event.target instanceof HTMLButtonElement &&
+          event.target.matches(".lyric-break-dot, .lyric-control")) event.target.blur();
+    }}>
     <header className="topbar">
       <div className="brand"><span className="brand-icon"><Music2 size={21} /></span><span>Rehearsal<span className="brand-accent">Chart</span></span></div>
+      <div className="header-chart">
+          <div className="header-chart-name">
+            <strong title={chart.title}>{chart.title}</strong>
+            {fileName && <span title={fileName}>{fileName}</span>}
+          </div>
+          <input ref={upload} type="file" accept=".musicxml,.xml,application/xml,text/xml" onChange={onFile} hidden />
+          <Button className="upload-button" aria-label="Upload MusicXML" onClick={() => upload.current?.click()}
+            onDragOver={event => event.preventDefault()} onDrop={event => { event.preventDefault(); void readFile(event.dataTransfer.files[0]); }}>
+            <FileUp size={15} /> Upload
+          </Button>
+        <span className="header-chart-count">{chart.measures.length} measures · {pages.length} {pages.length === 1 ? "page" : "pages"}</span>
+      </div>
       <Button className="print-button" onClick={() => window.print()}><Printer size={17} /> Print chart</Button>
     </header>
-    <div className="workspace">
-      <aside className="sidebar">
-        <section className="panel">
-          <h2><FileMusic size={17} /> Score</h2>
-          <div className="file-card"><FileMusic size={19} /><div><strong>{chart.title}</strong><span>{fileName || "Example score"}</span></div></div>
-          <input ref={upload} type="file" accept=".musicxml,.xml,application/xml,text/xml" onChange={onFile} hidden />
-          <Button className="upload-button" onClick={() => upload.current?.click()}
-            onDragOver={event => event.preventDefault()} onDrop={event => { event.preventDefault(); void readFile(event.dataTransfer.files[0]); }}>
-            <FileUp size={17} /> Upload MusicXML
-          </Button>
-          {error && <p role="alert" className="error">{error}</p>}
-          {chart.parts.length > 1 && <Select label="Score part" value={chart.partId} onChange={id => load(parseMusicXML(xml.current, id))}>
-            {chart.parts.map(part => <option key={part.id} value={part.id}>{part.name}</option>)}
-          </Select>}
+    <div className="chart-toolbar" role="group" aria-label="Chart controls">
+      <div className="toolbar-selects">
+        {chart.parts.length > 1 && <Select label="Score part" value={chart.partId} onChange={id => load(parseMusicXML(xml.current, id))}>
+          {chart.parts.map(part => <option key={part.id} value={part.id}>{part.name}</option>)}
+        </Select>}
+        <Select label="Transpose" value={target} onChange={setTarget} inline>
+          <option value="">{chart.key ? chart.key.tonic + " · original" : "Original (unknown key)"}</option>
+          {chart.key && keys.filter(key => key !== chart.key?.tonic).map(key => <option key={key}>{key}</option>)}
+        </Select>
+      </div>
+      <PopoverGroup className="toolbar-actions">
+        <ChartFlyout label="Layout" icon={<SlidersHorizontal size={16} />}>
           {chart.verses.length > 1 && <Select label="Lyrics" value={verse} onChange={setVerse}>
             <option value="">All verses</option>{chart.verses.map(id => <option key={id} value={id}>Verse {id}</option>)}
           </Select>}
-          <Select label="Transpose to" value={target} onChange={setTarget}>
-            <option value="">{chart.key ? chart.key.tonic + " · original" : "Original (unknown key)"}</option>
-            {chart.key && keys.filter(key => key !== chart.key?.tonic).map(key => <option key={key}>{key}</option>)}
-          </Select>
-        </section>
-
-        <section className="panel">
-          <h2><SlidersHorizontal size={17} /> Layout</h2>
-          <div className="settings-grid">
-            <Select label="Max. measures per line" value={settings.perLine} onChange={value => setting("perLine", Number(value))}>
-              <option value="0">Fit lyrics</option>
-              {[1,2,3,4,5,6].map(value => <option key={value}>{value}</option>)}
-            </Select>
-            <Select label="Paper size" value={settings.paper} onChange={value => setting("paper", value as keyof typeof paperSizes)}>
-              <option value="letter">US Letter</option><option value="a4">A4</option>
-            </Select>
-            <Select label="Chord size" value={settings.chordSize} onChange={value => setting("chordSize", Number(value))}>
-              {[12,14,16,18,20,22].map(value => <option key={value} value={value}>{value} px</option>)}
-            </Select>
-            <Select label="Lyric size" value={settings.lyricSize} onChange={value => setting("lyricSize", Number(value))}>
-              {[10,11,12,13,14,15,16,18].map(value => <option key={value} value={value}>{value} px</option>)}
-            </Select>
-          </div>
           <Select label="Beat ticks" value={beatTicks} onChange={value => setting("beatTicks", value as BeatTicks)}>
             <option value="always">Always</option>
             <option value="never">Never</option>
             <option value="without-lyrics">Only in bars without lyrics</option>
           </Select>
+          <Select label="Paper size" value={settings.paper} onChange={value => setting("paper", value as keyof typeof paperSizes)}>
+            <option value="letter">US Letter</option><option value="a4">A4</option>
+          </Select>
           <Select label="Print margins" value={settings.margin} onChange={value => setting("margin", Number(value))}>
             <option value="0.4">Narrow · 0.4″</option><option value="0.55">Standard · 0.55″</option><option value="0.75">Wide · 0.75″</option>
           </Select>
-          <fieldset className="chart-colors">
-            <legend>Chart colors</legend>
+          <div className="toggles">
+            <Field className="toggle"><Checkbox className="check" checked={settings.numbers} onChange={value => setting("numbers", value)}>{settings.numbers && <Check size={13} />}</Checkbox><Label>Measure numbers</Label></Field>
+            <Field className="toggle"><Checkbox className="check" checked={settings.cues} onChange={value => setting("cues", value)}>{settings.cues && <Check size={13} />}</Checkbox><Label>Performance cues</Label></Field>
+          </div>
+        </ChartFlyout>
+        <ChartFlyout label="Chart styles" icon={<Palette size={16} />}>
+          <fieldset className="chart-styles">
+            <legend>Chart styles</legend>
+            <div className="chart-style-grid">
+              <div className="chart-style-headings" aria-hidden="true"><span></span><span>Size</span><span>Color</span></div>
             {([
-              ["measureColor", "Measures, repeats, and cues"],
-              ["chordColor", "Chords"],
-              ["lyricColor", "Lyrics"]
-            ] as const).map(([key, label]) => {
+              ["chordColor", "Chords", "chordSize", [12,14,16,18,20,22]],
+              ["lyricColor", "Lyrics", "lyricSize", [10,11,12,13,14,15,16,18,20,22]],
+              ["rehearsalColor", "Rehearsal marks", "rehearsalSize", [10,11,12,13,14,16,18,20,22]],
+              ["cueColor", "Performance cues", "cueSize", [10,11,12,13,14,16,18,20,22]],
+              ["measureColor", "Measures and repeats", undefined, []]
+            ] as const).map(([key, label, sizeKey, sizes]) => {
               const color = settings[key] ?? chartColors[key];
-              return <div className="color-setting" key={key}>
+              return <div className="chart-style-row" key={key}>
                 <label htmlFor={key}>{label}</label>
+                {sizeKey ? <select aria-label={label + " size"} value={settings[sizeKey] ?? initial[sizeKey]}
+                  onChange={event => setting(sizeKey, Number(event.target.value))}>
+                  {sizes.map(value => <option key={value} value={value}>{value} px</option>)}
+                </select> : <span className="chart-style-no-size" aria-hidden="true">—</span>}
                 <div className="color-inputs">
                   <input id={key} type="color" value={color} onInput={event => setting(key, event.currentTarget.value)} />
                   <input key={color} type="text" aria-label={label + " hex color"} defaultValue={color}
@@ -490,48 +582,31 @@ export default function Editor() {
                 </div>
               </div>;
             })}
+            </div>
           </fieldset>
-          <div className="toggles">
-            <Field className="toggle"><Checkbox className="check" checked={settings.numbers} onChange={value => setting("numbers", value)}>{settings.numbers && <Check size={13} />}</Checkbox><Label>Measure numbers</Label></Field>
-            <Field className="toggle"><Checkbox className="check" checked={settings.cues} onChange={value => setting("cues", value)}>{settings.cues && <Check size={13} />}</Checkbox><Label>Performance cues</Label></Field>
-          </div>
-        </section>
-
-        <section className="panel breaks-panel">
-          <h2><Scissors size={17} /> Breaks</h2>
+        </ChartFlyout>
+        <ChartFlyout label="Breaks and keyboard shortcuts" icon={<CircleHelp size={18} />} iconOnly>
+          <h2>Breaks</h2>
           <p className="break-help">Select a lyric or barline. Press Enter for a line break or Command/Ctrl + Enter for a page break. Press Enter, Backspace, or Delete on a solid dot to remove the break.</p>
-          {chart.measures.length > 1 && <div className="settings-grid">
-            <Select label="Before measure" value={boundary} onChange={setBoundary}>
-              {chart.measures.slice(1).map((measure, index) => {
-                const type = measureBreak(index + 1);
-                return <option value={index + 1} key={index}>{measure.number}{type ? " · " + type : ""}</option>;
-              })}
-            </Select>
-            <Select label="Break type" value={measureBreak(Number(boundary)) || ""} onChange={value => {
-              setMeasureBreak(Number(boundary), value === "line" || value === "page" ? value : undefined);
-            }}>
-              <option value="">Automatic</option><option value="line">New line</option><option value="page">New page</option>
-            </Select>
-          </div>}
           <Button className="reset-button" onClick={() => { setSettings(initial); setBreaks({}); setLyricBreaks(new Set()); setSelectedLyric(undefined); }}><RotateCcw size={14} /> Reset layout</Button>
-        </section>
-      </aside>
-      <main className="preview" style={chartStyle}>
-        <div className="preview-bar"><strong>Chart preview</strong><span>{chart.measures.length} measures <span className="separator">·</span> {pages.length} {pages.length === 1 ? "page" : "pages"}</span></div>
-        <div className="canvas" ref={canvas}>
-          <div className="measurement" ref={measurement} aria-hidden="true">{chartHeader()}{rows.map(row => renderRow(row))}<div ref={widthProbe} className="measure-widths">{fragments.map(fragment => renderMeasure(fragment))}</div></div>
-          <div className="sheets" data-overwide={measureWidths.some(width => width > contentWidth) || undefined}>
-            {pages.map((page, index) => <article className="sheet" key={index} aria-label={"Page " + (index + 1)}
-              style={{ "--preview-page-width": Math.max(paper.width, ...page.map(row =>
-                row.widths.reduce((sum, width) => sum + width, 0) + 2 * margin)) + "px" } as CSSProperties}>
-              {index === 0 ? chartHeader() : <div className="continuation">{chart.title}</div>}
-              {page.map(row => renderRow(row, true))}
-              <footer><span>{chart.title}</span><span>{index + 1} / {pages.length}</span></footer>
-            </article>)}
-          </div>
-        </div>
-        <style>{`@page { size: ${paper.css}; margin: 0; }`}</style>
-      </main>
+        </ChartFlyout>
+      </PopoverGroup>
+      {error && <p role="alert" className="error toolbar-error">{error}</p>}
     </div>
+    <main className="preview" style={chartStyle}>
+      <div className="canvas" ref={canvas}>
+        <div className="measurement" ref={measurement} aria-hidden="true">{chartHeader()}{rows.map(row => renderRow(row))}<div ref={widthProbe} className="measure-widths">{fragments.map(fragment => renderMeasure(fragment))}</div></div>
+        <div className="sheets" data-overwide={measureLayouts.some(layout => layout.width > contentWidth) || undefined}>
+          {pages.map((page, index) => <article className="sheet" key={index} aria-label={"Page " + (index + 1)}
+            style={{ "--preview-page-width": Math.max(paper.width, ...page.map(row =>
+              row.widths.reduce((sum, width) => sum + width, 0) + 2 * margin)) + "px" } as CSSProperties}>
+            {index === 0 ? chartHeader() : <div className="continuation">{chart.title}</div>}
+            {page.map(row => renderRow(row, true))}
+            <footer><span>{chart.title}</span><span>{index + 1} / {pages.length}</span></footer>
+          </article>)}
+        </div>
+      </div>
+      <style>{`@page { size: ${paper.css}; margin: 0; }`}</style>
+    </main>
   </div>;
 }
